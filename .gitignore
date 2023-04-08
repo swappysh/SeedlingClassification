@@ -2,3 +2,4 @@ plant-seedlings-classification.zip
 sample_submission.csv
 test/
 train/
+best_model.pt
