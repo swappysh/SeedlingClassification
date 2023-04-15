@@ -8,7 +8,7 @@
 # 
 # - Give ERM/IRM a shot to improve the performance
 
-# In[4]:
+# In[1]:
 
 
 # Run following commands if running on local
@@ -19,7 +19,7 @@
 # !unzip -q plant-seedlings-classification.zip
 
 
-# In[5]:
+# In[2]:
 
 
 # # Kaggle specific variables comment if running somewhere else
@@ -29,7 +29,7 @@
 # SAVE_MODEL = '../../working/best_model.pt'
 
 
-# In[6]:
+# In[3]:
 
 
 # Folder structure
@@ -68,7 +68,7 @@ dataset = datasets.ImageFolder('./train', transform=transforms)
 
 # ### Class Distribution
 
-# In[7]:
+# In[4]:
 
 
 # Plot class distribution
@@ -85,7 +85,7 @@ plt.show()
 
 # ### Sampling imbalance classes
 
-# In[8]:
+# In[5]:
 
 
 from torch.utils.data import DataLoader
@@ -103,7 +103,7 @@ def sampler(indices):
     return sampler
 
 
-# In[9]:
+# In[6]:
 
 
 from torch.utils.data import DataLoader, random_split
@@ -128,14 +128,14 @@ val = DataLoader(Subset(dataset, val_indices), sampler=sampler(val_indices), bat
 
 # ### Visualize distribution after sampling
 
-# In[ ]:
+# In[7]:
 
 
 # import plt
 from matplotlib import pyplot as plt
 
 
-# In[10]:
+# In[8]:
 
 
 # # Plot class distribution histogram for training data
@@ -151,7 +151,7 @@ from matplotlib import pyplot as plt
 # plt.show()
 
 
-# In[11]:
+# In[9]:
 
 
 # # Plot class distribution histogram for validation data
@@ -169,7 +169,7 @@ from matplotlib import pyplot as plt
 
 # ### Visualize images
 
-# In[12]:
+# In[10]:
 
 
 # def visualizeBatch(batch, classes=None):
@@ -192,14 +192,14 @@ from matplotlib import pyplot as plt
 #     plt.show()
 
 
-# In[13]:
+# In[11]:
 
 
 # trainBatch = next(iter(train))
 # visualizeBatch(trainBatch, dataset.classes)
 
 
-# In[14]:
+# In[12]:
 
 
 # testBatch = next(iter(test))
@@ -208,7 +208,7 @@ from matplotlib import pyplot as plt
 
 # ### FineTuning resnet-50
 
-# In[15]:
+# In[13]:
 
 
 import torch
@@ -254,7 +254,7 @@ class CustomResNet(nn.Module):
 model = CustomResNet().to(device)
 
 
-# In[17]:
+# In[14]:
 
 
 class EarlyStopper:
@@ -288,7 +288,7 @@ except NameError:
         model.load_state_dict(torch.load('best_model.pt', map_location=torch.device(device)))
 
 
-# In[26]:
+# In[15]:
 
 
 from tqdm import tqdm
@@ -310,13 +310,13 @@ def train_loop(model, train, val, optimizer, loss_fn, scheduler, early_stopper, 
             
             optimizer.zero_grad()
             output = model(image, labels=label)
-            loss = loss_fn(output.logits, label)
+            loss = loss_fn(output[1], label)
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
             loops += 1
-            predicted = output.logits.argmax(-1)
+            predicted = output[1].argmax(-1)
             total_correct += (predicted == label).sum().item()
         
         print(f'Epoch: {epoch}, Training Loss: {total_loss/loops:.2f}, Training Accuracy: {(total_correct/(loops*BATCH_SIZE))*100:.2f}%')
@@ -331,11 +331,11 @@ def train_loop(model, train, val, optimizer, loss_fn, scheduler, early_stopper, 
                 label = label.to(device)
                 
                 output = model(image, labels=label)
-                loss = loss_fn(output.logits, label)
+                loss = loss_fn(output[1], label)
                 
                 total_loss += loss.item()
                 loops += 1
-                predicted = output.logits.argmax(-1)
+                predicted = output[1].argmax(-1)
                 total_correct += (predicted == label).sum().item()
                 
                 # store predicted and label for confusion matrix
@@ -360,7 +360,7 @@ def train_loop(model, train, val, optimizer, loss_fn, scheduler, early_stopper, 
     return model, pred_cm, label_cm
 
 
-# In[27]:
+# In[16]:
 
 
 from torch.optim import lr_scheduler
@@ -372,7 +372,7 @@ scheduler = lr_scheduler.ReduceLROnPlateau(optimizer)
 early_stopper = EarlyStopper(patience=10, min_delta=0.001)
 
 
-# In[28]:
+# In[82]:
 
 
 model, pred_cm, label_cm = train_loop(model, train, val, optimizer, criteria, scheduler, early_stopper, epochs=epoch)
@@ -391,6 +391,189 @@ print(conf_mat)
 class_accuracy=100*conf_mat.diagonal()/conf_mat.sum(1)
 print(class_accuracy)
 
+
+# ## Train a ViT
+
+# In[17]:
+
+
+# Folder structure
+# Training data
+# contains images in 12 folders, each folder contains images of a single class
+# Test data
+# contains all images in a single folder
+
+# Load the data
+from torchvision import datasets, transforms
+from transformers import AutoImageProcessor
+
+image_processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+size = (
+    (image_processor.size["shortest_edge"], image_processor.size["shortest_edge"])
+    if "shortest_edge" in image_processor.size
+    else (image_processor.size["height"], image_processor.size["width"])
+)
+
+# How many transformations are good?
+transforms = transforms.Compose([
+    # transforms.Resize((256, 256)),
+    transforms.Resize(size),
+    # RandomResizedCrop being used here --> https://huggingface.co/docs/transformers/main/en/tasks/image_classification
+    transforms.RandomRotation(360),
+    transforms.RandomResizedCrop(size),
+    transforms.ColorJitter(),
+    transforms.RandomGrayscale(),
+    transforms.RandomInvert(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=image_processor.image_mean, std=image_processor.image_std),
+])
+
+dataset = datasets.ImageFolder('./train', transform=transforms)
+
+
+# In[18]:
+
+
+from torch.utils.data import DataLoader, random_split
+from torch.utils.data import Subset
+from collections import Counter
+
+# Split validation data from training data
+dataset_size = len(dataset)
+indices = list(range(dataset_size))
+np.random.shuffle(indices) # shuffle the dataset before splitting into train and val
+print(f'dataset_size: {dataset_size}')
+
+split = int(np.floor(0.8 * dataset_size))
+train_indices, val_indices = indices[:split], indices[split:]
+
+# 
+BATCH_SIZE = 24
+
+train = DataLoader(Subset(dataset, train_indices), sampler=sampler(train_indices), batch_size=BATCH_SIZE)
+val = DataLoader(Subset(dataset, val_indices), sampler=sampler(val_indices), batch_size=BATCH_SIZE)
+
+
+# In[19]:
+
+
+from transformers import ViTModel
+from torch import nn
+from transformers.modeling_outputs import ImageClassifierOutput
+
+class CustomViT(nn.Module):
+    def __init__(self, checkpoint="google/vit-base-patch16-224", num_classes=12):
+        super(CustomViT, self).__init__()
+        self.num_classes = num_classes
+        self.model = ViTModel.from_pretrained(checkpoint)
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(0.1)
+        # self.pooling = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # (layernorm): LayerNorm((768,), eps=1e-12, elementwise_affine=True)
+        # (classifier): Linear(in_features=768, out_features=1000, bias=True)
+        
+        self.classifier = nn.Linear(768, self.num_classes)
+    
+    def forward(self, 
+                x,
+                head_mask = None,
+                labels = None,
+                output_attentions = None,
+                output_hidden_states = None,
+                interpolate_pos_encoding = None,
+                return_dict = None
+                ):
+        outputs = self.model(
+            x,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+
+        logits = self.classifier(sequence_output[:, 0, :])
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+        
+        # return ImageClassifierOutputWithNoAttention(loss=loss, logits=logits)
+        return ImageClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+model = CustomViT().to(device)
+
+
+# In[22]:
+
+
+from torch.optim import lr_scheduler
+
+epoch = 100
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+criteria = torch.nn.CrossEntropyLoss()
+scheduler = lr_scheduler.ReduceLROnPlateau(optimizer)
+early_stopper = EarlyStopper(patience=10, min_delta=0.001)
+
+
+# In[23]:
+
+
+model, pred_cm, label_cm = train_loop(model, train, val, optimizer, criteria, scheduler, early_stopper, epochs=epoch)
+
+
+# In[ ]:
+
+
+from sklearn.metrics import confusion_matrix
+
+# Confusion matrix
+conf_mat=confusion_matrix(pred_cm.numpy(), label_cm.numpy())
+print(conf_mat)
+
+# Per-class accuracy
+class_accuracy=100*conf_mat.diagonal()/conf_mat.sum(1)
+print(class_accuracy)
+
+
+# ## Ensemble of CustomResnet and another CustomResnet
+
+# In[ ]:
+
+
+class Ensemble(nn.Module):
+    def __init__(self, model1, model2, num_classes=12):
+        super(Ensemble, self).__init__()
+        self.model1 = model1
+        self.model2 = model2
+        self.fc = nn.Linear(2*num_classes, num_classes)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x):
+        x1 = self.model1(x)
+        x2 = self.model2(x)
+        x = torch.cat((x1, x2), dim=1)
+        x = self.dropout(x)
+        x = self.relu(x)
+        x = self.fc(x)
+        return x
+
+
+# ## Saving the best model to file
 
 # In[30]:
 
