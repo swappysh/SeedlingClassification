@@ -4,6 +4,12 @@
 # Load the data
 from torchvision import datasets, transforms
 from transformers import AutoImageProcessor
+import torch, random, numpy as np
+
+# setting random seed
+torch.manual_seed(0)
+random.seed(0)
+np.random.seed(0)
 
 image_processor = AutoImageProcessor.from_pretrained("microsoft/resnet-50")
 size = (
@@ -147,11 +153,45 @@ class EarlyStopper:
 
 from tqdm import tqdm
 
+# Evaluation loop
+def eval_loop(model, val, loss_fn, device, model_name="ensemble"):
+    pred_cm, label_cm = torch.empty(0), torch.empty(0)
+    total_loss, total_correct = 0, 0
+    loops = 0
+    model.eval()
+    with torch.no_grad():
+        for i, (image, label) in enumerate(tqdm(val)):
+            image = image.to(device)
+            label = label.to(device)
+            
+            output = model(image, labels=label)
+            match model_name:
+                case "resnet":
+                    output = output.logits
+                case "vit":
+                    if label is not None:
+                        output = output[1]
+                    else:
+                        output = output[0]
+                        
+            loss = loss_fn(output, label)
+            
+            total_loss += loss.item()
+            loops += 1
+            predicted = output.argmax(-1)
+            total_correct += (predicted == label).sum().item()
+            
+            # store predicted and label for confusion matrix
+            pred_cm = torch.cat((pred_cm, predicted.cpu()), 0)
+            label_cm = torch.cat((label_cm, label.cpu()), 0)
+            
+        print(f'Validation Loss: {total_loss/loops:.2f}, Validation Accuracy: {(total_correct/(loops*BATCH_SIZE))*100:.2f}%')
+        return total_loss/loops, (total_correct/(loops*BATCH_SIZE))*100, pred_cm, label_cm
+
 # define trainingloop
 def train_loop(model, train, val, optimizer, loss_fn, scheduler, early_stopper, epochs=10):
     new_lr = 0.1
-    pred_cm = torch.empty(0)
-    label_cm = torch.empty(0)
+    pred_cm, label_cm = torch.empty(0), torch.empty(0)
     best_val_acc = 0
     for epoch in range(epochs):
         model.train()
@@ -173,39 +213,20 @@ def train_loop(model, train, val, optimizer, loss_fn, scheduler, early_stopper, 
             predicted = output.argmax(-1)
             total_correct += (predicted == label).sum().item()
         
-        print(f'Epoch: {epoch}, Training Loss: {total_loss/loops:.2f}, Training Accuracy: {(total_correct/(loops*BATCH_SIZE))*100:.2f}%')
+        print(f'Epoch: {epoch}, Training Loss: {total_loss/loops:.2f}, Training Accuracy: {(total_correct/(loops*BATCH_SIZE))*100:.2f}%, Learning rate: {new_lr}')
         
-        total_loss = 0
-        total_correct = 0
-        loops = 0
-        model.eval()
-        with torch.no_grad():
-            for i, (image, label) in enumerate(tqdm(val)):
-                image = image.to(device)
-                label = label.to(device)
-                
-                output = model(image, labels=label)
-                loss = loss_fn(output, label)
-                
-                total_loss += loss.item()
-                loops += 1
-                predicted = output.argmax(-1)
-                total_correct += (predicted == label).sum().item()
-                
-                # store predicted and label for confusion matrix
-                pred_cm = torch.cat((pred_cm, predicted.cpu()), 0)
-                label_cm = torch.cat((label_cm, label.cpu()), 0)
-                
-            print(f'Epoch: {epoch}, Validation Loss: {total_loss/loops:.2f}, Validation Accuracy: {(total_correct/(loops*BATCH_SIZE))*100:.2f}%')
-            
-            # Save model if validation accuracy is better than previous best
-            if (total_correct/(loops*BATCH_SIZE))*100 > best_val_acc:
-                best_val_acc = (total_correct/(loops*BATCH_SIZE))*100
-                try:
-                    torch.save(model.state_dict(), SAVE_MODEL)
-                except NameError:
-                    torch.save(model.state_dict(), 'best_model.pt')
-                print(f'Best model saved with validation accuracy: {best_val_acc:.2f}% and learning rate: {new_lr}')
+        val_loss, val_acc, pred, label= eval_loop(model, val, loss_fn, device)
+        pred_cm = torch.cat((pred_cm, pred), 0)
+        label_cm = torch.cat((label_cm, label), 0)
+        
+        # Save model if validation accuracy is better than previous best
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            try:
+                torch.save(model.state_dict(), SAVE_MODEL)
+            except NameError:
+                torch.save(model.state_dict(), 'best_model.pt')
+            print(f'Best model saved with validation accuracy: {best_val_acc:.2f}% and learning rate: {new_lr}')
         scheduler.step(total_loss)
         new_lr = optimizer.param_groups[0]["lr"]
         if early_stopper.early_stop(total_loss):             
@@ -324,19 +345,24 @@ class Ensemble(nn.Module):
         # Assuming model1 to be resnet and model2 to be ViT
         self.model1 = model1
         self.model2 = model2
-        self.fc = nn.Linear(2*num_classes, num_classes)
+        self.fc = nn.Linear(2*num_classes, num_classes, bias=False)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.1)
         
+        # initialize weights
+        identity = torch.eye(self.fc.weight.shape[0]//2, self.fc.weight.shape[1])
+        self.fc.weight.data = torch.cat((identity, identity), dim=0)
+        
     def forward(self, x, labels=None):
-        x1 = self.model1(transforms_resnet(x), labels=labels)
-        x2 = self.model2(transforms_ViT(x), labels=labels)
+        x1 = self.model1(x, labels=labels)
+        x2 = self.model2(x, labels=labels)
         
         if labels is not None:
             x2 = x2[1]
         else:
             x2 = x2[0]
         
+        x = x1.logits
         x = torch.cat((x1.logits, x2), dim=1)
         x = self.dropout(x)
         x = self.relu(x)
@@ -344,24 +370,43 @@ class Ensemble(nn.Module):
         return x
 
 # Load the models
-model_ResNet.load_state_dict(torch.load("best_model.pt.8_apr_94.9", map_location=torch.device(device)))
+model_ResNet.load_state_dict(torch.load("best_model.pt.8_apr_93", map_location=torch.device(device)))
 model_ViT.load_state_dict(torch.load("best_model.pt.16_apr_ViT.80", map_location=torch.device(device)))
 
 # Set the hyperparameters
 from torch.optim import lr_scheduler
 
-model = Ensemble(model_ResNet, model_ViT).to(device)
+model_ensemble = Ensemble(model_ResNet, model_ViT).to(device)
+
+# Freeze the weights of the models
+for param in model_ensemble.model1.parameters():
+    param.requires_grad = False
+    
+for param in model_ensemble.model2.parameters():
+    param.requires_grad = False
+
+count = 0
+for param in model_ensemble.parameters():
+    if param.requires_grad:
+        count += 1
+print(f'Number of trainable parameters: {count}')
+
 epoch = 100
-optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+optimizer = torch.optim.SGD(model_ensemble.parameters(), lr=0.1)
 criteria = torch.nn.CrossEntropyLoss()
 scheduler = lr_scheduler.ReduceLROnPlateau(optimizer)
-early_stopper = EarlyStopper(patience=10, min_delta=0.001)
+early_stopper = EarlyStopper(patience=15, min_delta=0.001)
+
+# evaluation on resnet
+# eval_loop(model_ensemble, val, criteria, device)
+# eval_loop(model_ResNet, val, criteria, device, model_name="resnet")
+# exit()
 
 # Train the ensemble model
-model, pred_cm, label_cm = train_loop(model, train, val, optimizer, criteria, 
+model_ensemble, pred_cm, label_cm = train_loop(model_ensemble, train, val, optimizer, criteria, 
                                       scheduler, early_stopper, epochs=epoch)
 
-# Print the confusion matrix
+# # Print the confusion matrix
 from sklearn.metrics import confusion_matrix
 
 # Confusion matrix
@@ -393,7 +438,7 @@ df = pd.DataFrame(columns=['file', 'species'])
 # Run model over test data
 for file_name in tqdm(glob.glob(os.path.join('./test', '*.png'))):
     image = transforms(Image.open(file_name)).to(device)
-    output = model(image.unsqueeze(0))
+    output = model_ensemble(image.unsqueeze(0))
     predicted = output.argmax(-1).item()
     
     # concat to dataframe
@@ -401,10 +446,3 @@ for file_name in tqdm(glob.glob(os.path.join('./test', '*.png'))):
 
 # Save file to csv
 df.to_csv('submission.csv', index=False)
-
-
-# In[ ]:
-
-
-
-
